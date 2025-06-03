@@ -22,6 +22,25 @@ import operator
 from itertools import pairwise
 from dataclasses import dataclass
 
+# Transformer modules
+import torch.nn as nn
+from einops import rearrange, einsum
+import numpy as np
+
+
+# Linear
+class Linear(nn.Module):
+    """Implementation of torch Linear from scratch"""
+    def __init__(self, in_features, out_features, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        super().__init__()
+        std = np.sqrt(2.0 / (in_features + out_features))
+        weights = torch.zeros((out_features, in_features), dtype= dtype, device=device)
+        nn.init.trunc_normal_(weights, std=1.0, a=-3.0*std, b=3.0*std)
+        self.weights = nn.Parameter(weights)
+
+    def forward(self, x: Tensor):
+        return einsum(self.weights, x, "d_out d_in, ... d_in -> ... d_out")
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -41,8 +60,20 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = Linear(d_in, d_out)
+    linear.weights = nn.Parameter(weights)
+    return linear.forward(in_features)
 
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        super().__init__()
+        embeddings = torch.zeros((num_embeddings, embedding_dim), dtype=dtype, device=device)
+        nn.init.trunc_normal_(embeddings, std=1.0, a=-3.0, b=3.0)
+        self.embeddings = nn.Parameter(embeddings)
+        
+    def forward(self, token_ids: Tensor) -> Tensor:
+        embeddings = self.embeddings[token_ids]
+        return embeddings
 
 def run_embedding(
     vocab_size: int,
@@ -63,7 +94,9 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding = Embedding(vocab_size, d_model)
+    embedding.embeddings = nn.Parameter(weights)
+    return embedding.forward(token_ids)
 
 
 def run_swiglu(
