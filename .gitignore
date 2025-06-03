@@ -1,3 +1,9 @@
+# Training Data
+/data
+
+# ipynb notebooks for testing (with prefix "test")
+test*.ipynb
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

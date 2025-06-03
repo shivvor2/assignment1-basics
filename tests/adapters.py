@@ -9,7 +9,14 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
-
+# Tokenizer
+import regex as re
+from collections import Counter
+from multiprocessing import Pool
+from functools import reduce
+import operator
+from itertools import pairwise
+from dataclasses import dataclass
 
 def run_linear(
     d_in: int,
@@ -560,6 +567,166 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+def find_chunk_boundaries(
+    file: BinaryIO, 
+    desired_num_chunks: int, 
+    split_special_token: bytes
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+def pre_tokenize(text: str, pattern: str) -> Counter[str]:
+    return Counter(match.group().strip() for match in re.finditer(pattern, text))
+
+def process_chunk(input_path: str | os.PathLike, start: int, end: int, special_tokens: list[str], pattern: str) -> Counter:
+    """
+    Process a single chunk of text. args: Tuple[int, int, str, List[str], str]
+    
+    Args:
+        start (int): Start position of chunk
+        end (int): End position of chunk
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        special_tokens: List of special tokens to remove
+        pattern: Regex pattern for pre-tokenization
+    
+    Returns:
+        Counter of pre-tokenized words with special tokens removed
+    """
+    
+    # Read the chunk
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    
+    # Remove special tokens
+    for token in special_tokens:
+        chunk = chunk.replace(token, " ")
+    
+    # Pre-tokenize and return counts
+    return pre_tokenize(chunk, pattern)
+
+@dataclass
+class MergeCandidate:
+    token_ids: tuple[int, int]
+    bytes_data: bytes
+
+def count_token_sequences(word_counter: Counter[str], word_to_ids: dict[str, list[int]]) -> Counter[tuple[int, int]]:
+    sequence_count: Counter[tuple[int, int]] = Counter()
+    for word, count in word_counter.items():
+        token_ids = word_to_ids[word]
+        for a, b in pairwise(token_ids):
+            sequence_count[(a,b)] += count
+    return sequence_count
+
+def count_token_sequences_parallel(
+    word_counter: Counter[str], 
+    word_to_ids: dict[str, list[int]], 
+    num_processes: int
+) -> Counter[tuple[int, int]]:
+    """
+    Count token sequences in parallel.
+    
+    Args:
+        word_counter: Counter mapping words to their frequencies
+        word_to_ids: Dictionary mapping words to their token ID sequences
+        num_processes: Number of processes to use
+    
+    Returns:
+        Counter of token pair frequencies
+    """
+    # Split words into chunks for parallel processing
+    all_words = list(word_counter.keys())
+    chunk_size = max(1, len(all_words) // num_processes)
+    word_chunks = [all_words[i:i + chunk_size] for i in range(0, len(all_words), chunk_size)]
+    
+    # Prepare arguments for parallel processing
+    chunk_data = [(chunk, word_to_ids, word_counter) for chunk in word_chunks]
+    
+    # Process in parallel
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(count_token_sequences, chunk_data)
+    
+    # Combine results
+    combined_count: Counter[tuple[int, int]] = reduce(operator.add, results, Counter())
+    
+    return combined_count
+
+def replace_merged_tokens(
+    word: str, 
+    token_ids: list[int], 
+    merge_sequences: dict[tuple[int, int], int]
+) -> tuple[str, list[int]]:
+    """
+    Replace merged token pairs with new tokens in a word's token ID sequence.
+    
+    Args:
+        word: The original word string
+        token_ids: List of token IDs for the word
+        merge_sequences: Dictionary mapping token pairs to their merged token ID
+    
+    Returns:
+        Tuple containing:
+            - word: The original word string (unchanged)
+            - new_token_ids: Updated list of token IDs with merges applied
+    """
+    i = 0
+    new_token_ids = []
+    
+    while i < len(token_ids):
+        # Check if current position starts a merge
+        if i < len(token_ids) - 1:
+            pair = (token_ids[i], token_ids[i + 1])
+            if pair in merge_sequences:
+                # Replace with merged token
+                new_token_ids.append(merge_sequences[pair])
+                i += 2  # Skip both tokens that were merged
+                continue
+        
+        # No merge at this position, keep the token
+        new_token_ids.append(token_ids[i])
+        i += 1
+    
+    return word, new_token_ids
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -577,6 +744,14 @@ def run_train_bpe(
             These strings will never be split into multiple tokens, and will always be
             kept as a single token. If these special tokens occur in the `input_path`,
             they are treated as any other string.
+            
+    Keyword Args:
+        num_processes (int, optional): Number of processes to use for parallel processing.
+            Defaults to 8.
+        pre_tokenize_pattern (str, optional): Regex pattern to be used for pre_tokenization.
+            Defaults to the GPT-2 tokenizer found [here](github.com/openai/tiktoken/pull/234/files:)
+        verbose (bool, optional): Whether to print the tokenization progression or not
+            Defaults to False 
 
     Returns:
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -588,4 +763,109 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    num_processes: int = kwargs.get("num_processes", 8)
+    PAT: str = kwargs.get("pre_tokenize_pattern", r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+    
+    # Pre-Tokenization
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, "<|endoftext|>".encode("utf-8"))
+            
+    chunk_args = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        # Create a tuple with arguments in the order expected by process_chunk
+        chunk_args.append((input_path, start, end, special_tokens, PAT))
+    
+    # Process chunks in parallel
+    with Pool(processes=num_processes) as pool:
+        counters = pool.starmap(process_chunk, chunk_args)
+        
+    combined_counter: Counter[str] = reduce(operator.add, counters, Counter())
+    
+    # Tokenization loop
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    byte_to_id: dict[bytes, int] = {bytes([i]): i for i in range(256)}
+    merges: list[tuple[bytes, bytes]] = []
+    
+    # Vocab sizes
+    target_vocab_size: int = vocab_size - len(special_tokens)
+    
+    # Convert words to sequences of token IDs
+    word_to_ids: dict[str, list[int]] = {}
+    word_counts: dict[str, int] = {}
+    
+    for word, count in combined_counter.items():
+        word_bytes = word.encode('utf-8')
+        word_counts[word] = count
+        word_to_ids[word] = [byte_to_id[bytes([b])] for b in word_bytes] # OK because no merging occurred yet
+    
+    
+    while len(vocab) < target_vocab_size:
+        
+        if kwargs.get("verbose", False):
+            print(f"Vocabulary size: {len(vocab)}/{target_vocab_size}")
+        
+        # Produce sequence counts (Parallelarizable)
+        sequence_count: Counter[tuple[int, int]] = count_token_sequences_parallel(combined_counter, word_to_ids, num_processes)
+        
+        # Token merge loop
+        # The goal is to merge multiple pairs if they "have nothing to do with each other" 
+        merged_ids: set[int] = set()
+        merge_sequences: dict[tuple[int, int], int] = {}
+        end_current_merge_iter: bool = False
+        
+        # Find all sequence of tokens for merging
+        while not end_current_merge_iter:
+            # Get candidates
+            max_count = max(sequence_count.values())
+            candidates: list[MergeCandidate] = []
+            for item, count in sequence_count.most_common():
+                if count == max_count:
+                    candidates.append(MergeCandidate(item, vocab[item[0]] + vocab[item[1]]))
+                else:
+                    break
+            candidates = sorted(candidates, key= lambda x: x.bytes_data) # now in lexicographic order
+            
+            # Trimming candidates list in case it could exceed the target vocabulary size
+            if len(candidates) > target_vocab_size - len(vocab):
+                candidates = candidates[:target_vocab_size - len(vocab)]
+            
+            for candidate in candidates:
+                # Check if candidate contains IDs that are involved in merges in this cycle 
+                if candidate.token_ids[0] in merged_ids or candidate.token_ids[1] in merged_ids:
+                    end_current_merge_iter = True
+                    break
+                else:
+                    merged_ids.update(candidate.token_ids) # Add current token ids to pairs
+                    new_token_id = len(vocab)
+                    vocab[new_token_id] = candidate.bytes_data
+                    byte_to_id[candidate.bytes_data] = new_token_id
+                    merges.append((vocab[candidate.token_ids[0]],vocab[candidate.token_ids[1]]))
+                    merge_sequences[candidate.token_ids] = new_token_id
+                    sequence_count.pop(candidate.token_ids)
+            
+        # Replace merged tokens with the new token for every word (Parallelarizable)
+        if merge_sequences:  # Only proceed if we have merges to apply
+            # Prepare arguments for parallel processing
+            word_data = [(word, token_ids, merge_sequences) 
+                         for word, token_ids in word_to_ids.items()]
+            
+            # Process in parallel using starmap instead of map
+            with Pool(processes=num_processes) as pool:
+                results = pool.starmap(replace_merged_tokens, word_data)
+            
+            # Update word_to_ids with the results
+            word_to_ids = dict(results)
+        else:
+            break
+    
+    # Add special tokens to vocabulary
+    for special_token in special_tokens:
+        token_bytes = special_token.encode('utf-8')
+        if token_bytes not in byte_to_id:
+            token_id = len(vocab)
+            vocab[token_id] = token_bytes
+            byte_to_id[token_bytes] = token_id
+    
+    return vocab, merges
+        
+                    
