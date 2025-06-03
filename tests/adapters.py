@@ -9,7 +9,11 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
-# Tokenizer
+# Tokenizer Class
+import json
+from itertools import islice
+
+# Tokenizer Training
 import regex as re
 from collections import Counter
 from multiprocessing import Pool
@@ -544,6 +548,163 @@ def run_load_checkpoint(
     """
     raise NotImplementedError
 
+# For reaL prod environment, will have to couple vocab/ bytes_to_ids and special_tokens/ special_token_bytes, or ban rerassignments completely
+# For special tokens, if there are multiple matches starting from a position, we will match with the longer token
+# e.g. byte sequence = "aabbccdd", special tokens = "aab", "aabbcc", then we will match with the longer special token "aabbcc"
+# We assume no overlapping between special tokens and 
+class BPETokenizer:
+    
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        
+        # "Normal" Vocabulary
+        self.vocab: dict[int, bytes] = vocab
+        self.bytes_to_ids: dict[bytes, int] = {v: k  for k, v in vocab.items()}
+        self.max_normal_vocab_length: int = max(len(v) for v in vocab.values())
+        
+        # Merges
+        self.merges: list[tuple[bytes, bytes]] = merges
+        
+        # Special tokens
+        self.special_tokens: list[str] = special_tokens
+        self.special_tokens_bytes: list[bytes] = [token.encode('utf-8') for token in special_tokens]
+        self.special_tokens_bytes_lengths = set(len(byte_sequence) for byte_sequence in self.special_token_bytes)
+    
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens=None):
+        with open(vocab_filepath) as f:
+            vocab_data = json.load(f)
+        
+        with open(merges_filepath) as f:
+            merges_data = json.load(f)
+            
+        vocab = {int(k): v.encode('utf-8') for k, v in vocab_data.items()}
+        merges = [(a.encode('utf-8'), b.encode('utf-8')) for a, b in merges_data]
+        
+        return cls(vocab, merges, special_tokens)
+    
+    def encode(self, text: str) -> list[int]:
+        text_bytes: bytes = text.encode('utf-8')
+        
+        # Create merges
+        text_bytes_list: list[bytes] = [b for b in text_bytes]
+        
+        i = 0
+        while i < len(text_bytes_list):
+        # Check if current position starts a merge
+            if i < len(text_bytes_list) - 1:
+                # Match with special tokens or merges, we increment from a position once no actions is 
+                # "Special Tokens"
+                matchable_special_token_lengths = set(length for length in self.special_tokens_bytes_lengths if i + length <= len(text_bytes_list))
+                for length in sorted(matchable_special_token_lengths, reverse=True):
+                    candidate: bytes = b''.join(text_bytes_list[i: i+length])
+                    if candidate in self.vocab.keys():
+                        text_bytes_list = text_bytes_list[:i] + [candidate] + text_bytes_list[(i + length) + 1:]
+                # "Normal" merging
+                pair = (text_bytes_list[i], text_bytes_list[i + 1])
+                if pair in self.merges:
+                    text_bytes_list = text_bytes_list[:i] + [pair[0] + pair[1]] + text_bytes_list[(i + 1) + 1:]
+                # No merges
+                else:
+                    i += 1
+            else:
+                i += 1 # Edge case for when i = len(text_bytes_list) - 1 (we arrived to the last byte), prevent infinite looping
+        
+        return [self.bytes_to_ids[byte] for byte in text_bytes_list]
+
+    
+    def encode_iterable(self, iterable: Iterable[str], chunk_length: int = 40000) -> Iterable[int]:
+        """
+        Encode an iterable of strings into token IDs, processing in chunks to save memory.
+        
+        Args:
+            iterable (Iterable[str]): An iterable of strings (for lazy loading)
+            chunk_length (int, optional): Amount of string items to load every time we exhaust our chunk. Defaults to 40000.
+
+        Returns:
+            Iterable[int]: An iterable of token IDs
+        """
+        max_vocab_length = max(self.max_normal_vocab_length, max(self.special_tokens_bytes_lengths) if self.special_tokens_bytes_lengths else 0)
+        
+        # Buffer to hold bytes that might span across chunks
+        buffer = b''
+        
+        # Process the iterable in chunks
+        for chunk_strings in self._chunk_iterable(iterable, chunk_length):
+            # Combine the buffer with the new chunk of strings
+            chunk_bytes = buffer + ''.join(chunk_strings).encode('utf-8')
+            
+            # Process all complete tokens in the chunk
+            processed_length = 0
+            text_bytes_list = [b for b in chunk_bytes]
+            
+            # Apply merges as in the encode method
+            i = 0
+            while i < len(text_bytes_list) - max_vocab_length + 1:
+                # Check for special tokens first
+                matched = False
+                matchable_special_token_lengths = [length for length in self.special_tokens_bytes_lengths 
+                                                if i + length <= len(text_bytes_list)]
+                
+                for length in sorted(matchable_special_token_lengths, reverse=True):
+                    candidate = b''.join(text_bytes_list[i:i+length])
+                    if candidate in self.special_tokens_bytes:
+                        # Found a special token
+                        token_id = self.bytes_to_ids[candidate]
+                        yield token_id
+                        i += length
+                        matched = True
+                        processed_length = i
+                        break
+                
+                if matched:
+                    continue
+                    
+                # Check for normal merges
+                if i < len(text_bytes_list) - 1:
+                    pair = (text_bytes_list[i], text_bytes_list[i + 1])
+                    if pair in self.merges:
+                        merged = pair[0] + pair[1]
+                        text_bytes_list[i:i+2] = [merged]
+                        # Don't increment i here to allow further merges
+                        continue
+                
+                # If we get here, no merges were possible
+                # Yield the token if it's in the vocabulary
+                token = text_bytes_list[i]
+                if token in self.bytes_to_ids:
+                    yield self.bytes_to_ids[token]
+                    processed_length = i + 1
+                
+                i += 1
+            
+            # Save the unprocessed part for the next chunk
+            buffer = chunk_bytes[processed_length:]
+        
+        # Process any remaining bytes in the buffer
+        if buffer:
+            for token_id in self.encode(buffer.decode('utf-8', errors='replace')):
+                yield token_id
+
+    def _chunk_iterable(self, iterable: Iterable[str], chunk_size: int) -> Iterable[list[str]]:
+        """
+        Helper method to chunk an iterable into lists of specified size.
+        
+        Args:
+            iterable: The input iterable
+            chunk_size: Size of each chunk
+            
+        Returns:
+            Iterable of lists containing chunks of the original iterable
+        """
+        iterator = iter(iterable)
+        while True:
+            chunk = list(islice(iterator, chunk_size))
+            if not chunk:
+                break
+            yield chunk
+        
+    def decode(self, ids: list[int]) -> str:
+        word_bytes: bytes = b''.join([self.vocab[word_id] for word_id in ids])
+        return word_bytes.decode("utf-8")
 
 def get_tokenizer(
     vocab: dict[int, bytes],
@@ -565,7 +726,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return BPETokenizer(vocab, merges, special_tokens)
+
 
 def find_chunk_boundaries(
     file: BinaryIO, 
